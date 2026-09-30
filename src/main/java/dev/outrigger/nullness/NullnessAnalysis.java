@@ -8,7 +8,9 @@ import com.github.javaparser.Range;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.CallableDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AssignExpr;
 import com.github.javaparser.ast.expr.BinaryExpr;
@@ -17,11 +19,19 @@ import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
+import com.github.javaparser.resolution.TypeSolver;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.outrigger.document.PositionEncoding;
 import dev.outrigger.document.TextDocument;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -58,24 +68,72 @@ final class NullnessAnalysis {
     private final Map<CallableDeclaration<?>, Set<String>> tracked = new HashMap<>();
     private final JsonArray added = new JsonArray();
 
-    private NullnessAnalysis(TextDocument document, PositionEncoding encoding, CompilationUnit unit) {
+    private NullnessAnalysis(TextDocument document, PositionEncoding encoding, CompilationUnit unit,
+            TypeSolver typeSolver) {
         this.document = document;
         this.encoding = encoding;
         this.unit = unit;
-        this.nullable = new NullableMethods(unit);
+        this.nullable = new NullableMethods(new MethodResolver(typeSolver));
         findUncheckedUses();
+        findUncheckedFields();
     }
 
     /** Parses the document; empty when it does not parse (e.g. while typing). */
     static Optional<NullnessAnalysis> of(TextDocument document, PositionEncoding encoding) {
-        ParserConfiguration config = new ParserConfiguration()
-                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_21)
-                .setTabSize(1);
-        ParseResult<CompilationUnit> result = new JavaParser(config).parse(document.text());
+        ParseResult<CompilationUnit> result = new JavaParser(parserConfiguration()).parse(document.text());
         if (!result.isSuccessful() || result.getResult().isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(new NullnessAnalysis(document, encoding, result.getResult().get()));
+        CompilationUnit unit = result.getResult().get();
+
+        // The JDK, and the other files of the module for calls into them
+        CombinedTypeSolver typeSolver = new CombinedTypeSolver(new ReflectionTypeSolver());
+        sourceRoot(document, unit).ifPresent(root -> {
+            try {
+                typeSolver.add(new JavaParserTypeSolver(root, parserConfiguration()));
+            } catch (RuntimeException e) {
+                // e.g. an unreadable directory: analyse the file on its own
+            }
+        });
+        new JavaSymbolSolver(typeSolver).inject(unit);
+
+        return Optional.of(new NullnessAnalysis(document, encoding, unit, typeSolver));
+    }
+
+    private static ParserConfiguration parserConfiguration() {
+        return new ParserConfiguration()
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_21)
+                .setTabSize(1);
+    }
+
+    /**
+     * The source folder the file belongs to: its directory without the
+     * directories of its package, e.g. {@code .../src/main/java} for
+     * {@code .../src/main/java/com/example/Foo.java} in {@code com.example}.
+     * Empty without a package, as the folder is then unknown (and would be
+     * scanned completely).
+     */
+    static Optional<Path> sourceRoot(TextDocument document, CompilationUnit unit) {
+        try {
+            URI uri = URI.create(document.uri());
+            if (!"file".equals(uri.getScheme())) {
+                return Optional.empty();
+            }
+            if (unit.getPackageDeclaration().isEmpty()) {
+                return Optional.empty();
+            }
+            Path dir = Path.of(uri).getParent();
+            List<String> packagePath = List.of(unit.getPackageDeclaration().get().getNameAsString().split("\\."));
+            for (int i = packagePath.size() - 1; i >= 0; i--) {
+                if (dir == null || !dir.getFileName().toString().equals(packagePath.get(i))) {
+                    return Optional.empty();
+                }
+                dir = dir.getParent();
+            }
+            return dir != null && Files.isDirectory(dir) ? Optional.of(dir) : Optional.empty();
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
     }
 
     JsonArray apply(JsonArray diagnostics) {
@@ -138,6 +196,45 @@ final class NullnessAnalysis {
         }
     }
 
+    /**
+     * Fields initialized with a value that can be null and never assigned
+     * again: their uses in the methods of the class are checked like local
+     * variables.
+     */
+    private void findUncheckedFields() {
+        for (FieldDeclaration field : unit.findAll(FieldDeclaration.class)) {
+            TypeDeclaration<?> owner = field.findAncestor(TypeDeclaration.class).orElse(null);
+            for (VariableDeclarator declarator : field.getVariables()) {
+                Optional<Expression> initializer = declarator.getInitializer();
+                String name = declarator.getNameAsString();
+                if (owner == null || initializer.isEmpty() || !nullable.mayBeNull(initializer.get())
+                        || unit.findFirst(AssignExpr.class, a -> NullChecks.isVar(a.getTarget(), name)).isPresent()) {
+                    continue;
+                }
+                String reason = nullable.resolve(initializer.get())
+                        .map(m -> " (" + m.getNameAsString() + "() can return null)")
+                        .orElse("");
+                for (CallableDeclaration<?> callable : owner.findAll(CallableDeclaration.class)) {
+                    if (declaresLocally(callable, name)) {
+                        continue; // a local variable or parameter hides the field
+                    }
+                    tracked.computeIfAbsent(callable, c -> new HashSet<>()).add(name);
+                    for (Expression scope : dereferencedScopes(callable)) {
+                        if (enclosingCallable(scope) == callable && NullChecks.isVar(scope, name)
+                                && !NullChecks.isChecked(scope, name, true)) {
+                            report(scope, "Potential null pointer access: field " + name + " may be null" + reason);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean declaresLocally(CallableDeclaration<?> callable, String name) {
+        return callable.getParameters().stream().anyMatch(p -> p.getNameAsString().equals(name))
+                || callable.findFirst(VariableDeclarator.class, d -> d.getNameAsString().equals(name)).isPresent();
+    }
+
     /** Expressions that are dereferenced: the scope of a method call or field access. */
     private static List<Expression> dereferencedScopes(Node root) {
         List<Expression> scopes = new ArrayList<>();
@@ -163,7 +260,7 @@ final class NullnessAnalysis {
 
     private boolean isInNullableReturn(Node node) {
         Optional<ReturnStmt> ret = node instanceof ReturnStmt r ? Optional.of(r) : node.findAncestor(ReturnStmt.class);
-        return ret.flatMap(r -> r.findAncestor(MethodDeclaration.class)).map(nullable::contains).orElse(false);
+        return ret.flatMap(r -> r.findAncestor(MethodDeclaration.class)).map(nullable::isNullable).orElse(false);
     }
 
     private static CallableDeclaration<?> enclosingCallable(Node node) {

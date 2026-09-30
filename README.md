@@ -27,15 +27,29 @@ Eclipse's null analysis only treats a variable as checked after a literal
 
   It follows `!`, `||`, `&&`, if/else, ternaries, `while` and early
   `return`/`throw`, and gives up at any re-assignment of the variable.
-- **Infers nullable methods.** A method whose `return` can yield `null` (directly,
-  via a ternary, or via another such method) is treated as `@Nullable` without
-  annotating it:
+- **Infers nullable methods.** A method whose `return` can yield `null`
+  (directly, via a ternary, via another such method, or via a local variable
+  holding such a value that isn't checked before the `return`) is treated as
+  `@Nullable` without annotating it:
   - it reports uses of the result without a null check (source `outrigger`),
   - it drops jdtls' "Dead code" on null checks of the result,
   - it drops jdtls' "Null type mismatch" on the method's own `return`s.
 
-Limits: inference covers methods in the same file, matched by name and argument
-count. Check methods are recognised by name, whatever class they come from.
+  Calls are resolved with JavaParser's symbol solver: methods of nested and
+  inner classes, calls qualified with a variable or a class name, and methods
+  in the module's other files (same source folder) are covered. When exact
+  resolution fails, e.g. because an argument's type comes from a library jar,
+  the method is looked up by name and argument count in the type the call is
+  made on. Overloads with the same argument count are left alone.
+- **Tracks fields and captured variables.** Fields initialized with a nullable
+  value and never assigned again are checked like local variables. A null
+  check in a method also covers the variable's uses in lambdas and anonymous
+  or local classes declared after it.
+
+Limits:
+- Calls into other modules and library jars are not analysed.
+- Check methods are recognised by name, whatever class they come from.
+- Only local variables and fields that are never re-assigned are tracked.
 
 ## Build
 

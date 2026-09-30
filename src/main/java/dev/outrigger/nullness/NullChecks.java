@@ -1,18 +1,19 @@
 package dev.outrigger.nullness;
 
 import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.body.ConstructorDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AssignExpr;
 import com.github.javaparser.ast.expr.BinaryExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.EnclosedExpr;
 import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.NullLiteralExpr;
+import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.UnaryExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.BreakStmt;
@@ -58,8 +59,12 @@ final class NullChecks {
         return expression;
     }
 
+    /** Whether {@code expression} is the variable {@code var}, or the field {@code this.var}. */
     static boolean isVar(Expression expression, String var) {
-        return unwrap(expression) instanceof NameExpr name && name.getNameAsString().equals(var);
+        Expression expr = unwrap(expression);
+        return expr instanceof NameExpr name && name.getNameAsString().equals(var)
+                || expr instanceof FieldAccessExpr field && field.getScope() instanceof ThisExpr
+                        && field.getNameAsString().equals(var);
     }
 
     /** Whether {@code condition} evaluating to {@code truth} proves that {@code var} is not null. */
@@ -99,14 +104,16 @@ final class NullChecks {
     /**
      * Whether {@code var} is known not to be null at {@code node}.
      *
-     * @param crossLambda continue into the enclosing method for captured
-     *                    variables; only sound for variables never re-assigned
+     * @param crossLambda continue from lambdas and from methods of anonymous
+     *                    and local classes into the enclosing method, for
+     *                    captured variables; only sound for variables never
+     *                    re-assigned
      */
     static boolean isChecked(Node node, String var, boolean crossLambda) {
         Node child = node;
         Node parent = node.getParentNode().orElse(null);
         while (parent != null) {
-            if (parent instanceof MethodDeclaration || parent instanceof ConstructorDeclaration) {
+            if (parent instanceof CallableDeclaration<?> callable && (!crossLambda || declares(callable, var))) {
                 return false;
             }
             if (parent instanceof LambdaExpr && !crossLambda) {
@@ -172,6 +179,12 @@ final class NullChecks {
                 && call.getNameAsString().equals("requireNonNull")
                 && call.getArguments().isNonEmpty()
                 && isVar(call.getArgument(0), var);
+    }
+
+    /** Whether {@code callable} has a parameter or local variable named {@code var}. */
+    private static boolean declares(CallableDeclaration<?> callable, String var) {
+        return callable.getParameters().stream().anyMatch(p -> p.getNameAsString().equals(var))
+                || callable.findFirst(VariableDeclarator.class, d -> d.getNameAsString().equals(var)).isPresent();
     }
 
     static boolean alwaysExits(Statement statement) {
