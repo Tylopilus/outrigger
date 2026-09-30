@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Runs a language server behind Outrigger:  outrigger -- <server command...>
+# Uses $OUTRIGGER_JAVA, or `java` from PATH, to run Outrigger itself.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+exec "${OUTRIGGER_JAVA:-java}" -jar "$dir/target/outrigger.jar" "$@"

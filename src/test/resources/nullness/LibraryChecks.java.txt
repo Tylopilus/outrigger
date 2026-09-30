@@ -1,0 +1,44 @@
+class Cases {
+    boolean yourCode(Res country, Res city) {
+        final A a = x(); final B b = y();
+        if (ObjectUtils.anyNull(a, b) || ObjectUtils.anyNull(a.g(), b.h())) { // DROP a, DROP b
+            return false;
+        }
+        return a.g().equals(1); // DROP a
+    }
+    void andAllNotNull(A a) {
+        if (ObjectUtils.allNotNull(a) && a.g()) {} // DROP a
+    }
+    void insideIf(A a) {
+        if (allNotNull(a, c)) { a.g(); } // DROP a
+        if (!ObjectUtils.anyNull(a)) { a.g(); } // DROP a
+        if (anyNull(a)) { log(); } else { a.g(); } // DROP a
+    }
+    void negatives(A a, A z) {
+        if (anyNull(a)) { a.g(); } // KEEP a (inside the null branch)
+        if (anyNull(z)) { log(); } // no exit
+        z.g(); // KEEP z
+        if (!anyNull(a)) { return; }
+        a.g(); // KEEP a (exits when NOT null)
+    }
+    void reassigned(A a) {
+        if (anyNull(a)) { return; }
+        a = other();
+        a.g(); // KEEP a (re-assigned)
+    }
+    void otherVar(A a, A b) {
+        if (anyNull(a)) { return; }
+        b.g(); // KEEP b (not checked)
+    }
+    void orNotEnough(A a, A b) {
+        if (anyNull(a) && anyNull(b)) { return; }
+        a.g(); // KEEP a (&& only exits if both null)
+    }
+    void ternary(A a) {
+        int n = allNotNull(a) ? a.g() : 0; // DROP a
+    }
+    void lambda(A a) {
+        if (anyNull(a)) { return; }
+        run(() -> a.g()); // KEEP a (inside lambda, conservative)
+    }
+}

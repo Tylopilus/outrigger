@@ -1,0 +1,40 @@
+class Infer {
+    private <T> T resolveAndAdapt(String path, Class<T> c) {
+        Object r = find(path);
+        return r != null ? adapt(r) : null;
+    }
+    private String direct() { return null; }
+    private String viaOther() { return direct(); }
+    private String neverNull() { return "x"; }
+    @Nullable private String annotated() { return null; }
+    void callers() {
+        City city = resolveAndAdapt("p", City.class);
+        if (city == null) { // DEADCODE
+            return;
+        }
+        city.getName(); // OK checked
+        String s = direct();
+        s.trim(); // WARN s
+        String t = viaOther();
+        t.trim(); // WARN t
+        String u = neverNull();
+        u.trim(); // OK not nullable
+        String v = direct();
+        if (v != null) { v.trim(); } // OK checked
+        String w = direct();
+        if (StringUtils.isBlank(w)) { return; }
+        w.trim(); // OK isBlank
+        String x = direct();
+        Objects.requireNonNull(x);
+        x.trim(); // OK requireNonNull
+        direct().trim(); // WARN chained
+        String y = annotated();
+        y.trim(); // OK jdtls handles annotated
+        String z = direct();
+        z = "reassigned";
+        z.trim(); // OK reassigned not tracked
+        String q = direct();
+        if (anyNull(q)) { return; }
+        run(() -> q.trim()); // OK checked before lambda
+    }
+}
