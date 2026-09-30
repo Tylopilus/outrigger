@@ -60,6 +60,9 @@ class ResolutionTest {
                 void i2() { String s = checkedLocal(); s.trim(); } // OK: returns a checked local
                 void j() { String s = this.outerFind(); s.trim(); } // WARN
                 void k() { String s = outerFind(); if (s != null) { s.trim(); } } // OK
+                void l() { if (outerFind() != null && outerFind().isEmpty()) { } } // OK: same call checked
+                String m() { return outerFind() != null ? outerFind().trim() : ""; } // OK: same call checked
+                void n() { outerFind().trim(); } // WARN
             }
             """;
 

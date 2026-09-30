@@ -2,6 +2,7 @@ package dev.outrigger.proxy;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import dev.outrigger.document.DocumentStore;
 import dev.outrigger.document.PositionEncoding;
@@ -12,8 +13,14 @@ import dev.outrigger.rpc.MessageWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 
 /**
  * Sits between an editor (the client) and a language server, forwarding every
@@ -22,7 +29,9 @@ import java.util.Optional;
  * <p>Messages are forwarded byte-for-byte unless a feature changes them, so
  * server-specific extensions pass through untouched.
  */
-public final class Proxy {
+public final class Proxy implements ServerAccess {
+
+    private static final String REQUEST_ID_PREFIX = "outrigger-";
 
     private final MessageReader fromClient;
     private final MessageWriter toClient;
@@ -33,6 +42,13 @@ public final class Proxy {
 
     private volatile JsonElement initializeId;
 
+    private final AtomicInteger requestIds = new AtomicInteger();
+    private final Map<String, CompletableFuture<JsonElement>> pendingRequests = new ConcurrentHashMap<>();
+
+    /** The last publishDiagnostics message from the server per document, for {@link #republish}. */
+    private final Map<String, Message> lastDiagnostics = new HashMap<>();
+    private final Object diagnosticsLock = new Object();
+
     public Proxy(InputStream clientIn, OutputStream clientOut, InputStream serverIn, OutputStream serverOut,
             List<Feature> features) {
         this.fromClient = new MessageReader(clientIn);
@@ -40,6 +56,41 @@ public final class Proxy {
         this.fromServer = new MessageReader(serverIn);
         this.toServer = new MessageWriter(serverOut);
         this.features = features;
+        features.forEach(feature -> feature.attach(this));
+    }
+
+    @Override
+    public CompletableFuture<JsonElement> request(String method, JsonElement params) {
+        String id = REQUEST_ID_PREFIX + requestIds.incrementAndGet();
+        CompletableFuture<JsonElement> response = new CompletableFuture<>();
+        pendingRequests.put(id, response);
+        JsonObject message = new JsonObject();
+        message.addProperty("jsonrpc", "2.0");
+        message.addProperty("id", id);
+        message.addProperty("method", method);
+        message.add("params", params);
+        try {
+            toServer.write(message.toString());
+        } catch (IOException e) {
+            pendingRequests.remove(id);
+            response.completeExceptionally(e);
+        }
+        return response;
+    }
+
+    @Override
+    public void republish(Predicate<String> uri) {
+        synchronized (diagnosticsLock) {
+            for (Map.Entry<String, Message> entry : lastDiagnostics.entrySet()) {
+                if (uri.test(entry.getKey())) {
+                    try {
+                        toClient.write(rewriteDiagnostics(entry.getValue()).orElse(entry.getValue().raw()));
+                    } catch (IOException | RuntimeException e) {
+                        Log.error("republishing diagnostics failed", e);
+                    }
+                }
+            }
+        }
     }
 
     public DocumentStore documents() {
@@ -78,10 +129,12 @@ public final class Proxy {
         try {
             byte[] body;
             while ((body = fromServer.read()) != null) {
-                toClient.write(rewriteServer(body));
+                handleServer(body);
             }
         } catch (IOException e) {
             Log.error("reading from server failed", e);
+        } finally {
+            pendingRequests.values().forEach(r -> r.completeExceptionally(new IOException("server exited")));
         }
     }
 
@@ -105,18 +158,68 @@ public final class Proxy {
         }
     }
 
-    private byte[] rewriteServer(byte[] body) {
+    private void handleServer(byte[] body) throws IOException {
+        Message message;
         try {
-            Message message = Message.parse(body);
-            if (message.isResponse() && message.id().equals(initializeId)) {
-                observeInitializeResult(message.json());
-            } else if ("textDocument/publishDiagnostics".equals(message.method())) {
-                return rewriteDiagnostics(message).orElse(body);
-            }
+            message = Message.parse(body);
         } catch (RuntimeException e) {
-            Log.error("could not rewrite server message", e);
+            Log.error("could not parse server message", e);
+            toClient.write(body);
+            return;
         }
-        return body;
+        if (message.isResponse() && isOwnRequest(message.id())) {
+            completeOwnRequest(message);
+            return; // the editor never sent this request
+        }
+        if ("textDocument/publishDiagnostics".equals(message.method())) {
+            synchronized (diagnosticsLock) {
+                lastDiagnostics.put(message.params().get("uri").getAsString(), message);
+                toClient.write(rewriteSafely(message));
+            }
+            return;
+        }
+        if (message.isResponse() && message.id().equals(initializeId)) {
+            try {
+                observeInitializeResult(message.json());
+            } catch (RuntimeException e) {
+                Log.error("could not read the initialize result", e);
+            }
+        }
+        toClient.write(body);
+    }
+
+    private static boolean isOwnRequest(JsonElement id) {
+        return id.isJsonPrimitive() && id.getAsJsonPrimitive().isString()
+                && id.getAsString().startsWith(REQUEST_ID_PREFIX);
+    }
+
+    private void completeOwnRequest(Message message) {
+        CompletableFuture<JsonElement> response = pendingRequests.remove(message.id().getAsString());
+        if (response == null) {
+            return;
+        }
+        JsonObject json = message.json();
+        if (json.has("error")) {
+            response.completeExceptionally(new ServerError(json.get("error").toString()));
+        } else {
+            response.complete(json.has("result") ? json.get("result") : JsonNull.INSTANCE);
+        }
+    }
+
+    private byte[] rewriteSafely(Message message) {
+        try {
+            return rewriteDiagnostics(message).orElse(message.raw());
+        } catch (RuntimeException e) {
+            Log.error("could not rewrite diagnostics", e);
+            return message.raw();
+        }
+    }
+
+    /** An error response to a request Outrigger sent itself. */
+    public static final class ServerError extends RuntimeException {
+        ServerError(String error) {
+            super(error);
+        }
     }
 
     private void observeInitializeResult(JsonObject response) {

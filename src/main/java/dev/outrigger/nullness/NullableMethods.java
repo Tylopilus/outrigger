@@ -14,6 +14,7 @@ import com.github.javaparser.ast.expr.NullLiteralExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import java.util.IdentityHashMap;
+import dev.outrigger.library.LibraryNullness;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -32,12 +33,39 @@ final class NullableMethods {
     /** How many calls deep to follow, so that long call chains stay cheap. */
     private static final int MAX_DEPTH = 4;
 
+    /** How an expression can be null. */
+    enum Kind {
+        NONE,
+        /** The result of a method annotated {@code @Nullable}: jdtls reports its unchecked uses. */
+        ANNOTATED,
+        /** Found out by Outrigger. */
+        INFERRED
+    }
+
+    /** Whether an expression can be null, why (for the message; may be empty), and whether a library says so. */
+    record Nullability(Kind kind, String reason, boolean library) {
+        static final Nullability NONE = new Nullability(Kind.NONE, "", false);
+
+        Nullability(Kind kind, String reason) {
+            this(kind, reason, false);
+        }
+    }
+
     private final MethodResolver resolver;
+    private final LibraryNullness library;
+    private final boolean reportLibrary;
     private final Map<MethodDeclaration, Boolean> nullable = new IdentityHashMap<>();
     private int depth;
 
-    NullableMethods(MethodResolver resolver) {
+    /**
+     * {@code library} decides for methods without source; null to not look at
+     * them. {@code reportLibrary} says whether unchecked uses of nullable
+     * library methods are reported (not in test sources by default).
+     */
+    NullableMethods(MethodResolver resolver, LibraryNullness library, boolean reportLibrary) {
         this.resolver = resolver;
+        this.library = library;
+        this.reportLibrary = reportLibrary;
     }
 
     /** Whether {@code method} can return null although it isn't annotated to. */
@@ -62,22 +90,46 @@ final class NullableMethods {
 
     /** Whether evaluating {@code expression} can produce null. */
     boolean mayBeNull(Expression expression) {
-        Expression expr = NullChecks.unwrap(expression);
-        if (expr instanceof NullLiteralExpr) {
-            return true;
-        }
-        if (expr instanceof ConditionalExpr ternary) {
-            return mayBeNull(ternary.getThenExpr()) || mayBeNull(ternary.getElseExpr());
-        }
-        return resolve(expr).isPresent();
+        return of(expression).kind() != Kind.NONE;
     }
 
-    /** The nullable method that {@code expression} calls, if it is such a call. */
-    Optional<MethodDeclaration> resolve(Expression expression) {
-        if (NullChecks.unwrap(expression) instanceof MethodCallExpr call) {
-            return resolver.target(call).filter(this::isNullable);
+    /** Why {@code expression} can be null, when Outrigger found out (not jdtls through an annotation). */
+    Optional<String> reportable(Expression expression) {
+        Nullability nullability = of(expression);
+        return nullability.kind() == Kind.INFERRED && (reportLibrary || !nullability.library())
+                ? Optional.of(nullability.reason())
+                : Optional.empty();
+    }
+
+    Nullability of(Expression expression) {
+        Expression expr = NullChecks.unwrap(expression);
+        if (expr instanceof NullLiteralExpr) {
+            return new Nullability(Kind.INFERRED, "");
         }
-        return Optional.empty();
+        if (expr instanceof ConditionalExpr ternary) {
+            Nullability then = of(ternary.getThenExpr());
+            Nullability otherwise = of(ternary.getElseExpr());
+            return then.kind().compareTo(otherwise.kind()) >= 0 ? then : otherwise;
+        }
+        if (!(expr instanceof MethodCallExpr call)) {
+            return Nullability.NONE;
+        }
+        return resolver.target(call).map(target -> switch (target) {
+            case MethodResolver.Target.Source source -> isNullable(source.declaration())
+                    ? new Nullability(Kind.INFERRED, source.declaration().getNameAsString() + "() can return null")
+                    : Nullability.NONE;
+            case MethodResolver.Target.Library method -> library == null ? Nullability.NONE : fromLibrary(method);
+        }).orElse(Nullability.NONE);
+    }
+
+    private Nullability fromLibrary(MethodResolver.Target.Library method) {
+        LibraryNullness.Verdict verdict = library.of(method.owner(), method.name(), method.descriptor());
+        return switch (verdict.kind()) {
+            case NOT_NULLABLE -> Nullability.NONE;
+            case ANNOTATED -> new Nullability(Kind.ANNOTATED, method.display() + " is @Nullable", true);
+            case NULLABLE -> new Nullability(Kind.INFERRED,
+                    method.display() + " can return null: " + verdict.reason(), true);
+        };
     }
 
     private boolean returnsNull(ReturnStmt ret, MethodDeclaration method) {

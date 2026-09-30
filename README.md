@@ -44,12 +44,55 @@ Eclipse's null analysis only treats a variable as checked after a literal
 - **Tracks fields and captured variables.** Fields initialized with a nullable
   value and never assigned again are checked like local variables. A null
   check in a method also covers the variable's uses in lambdas and anonymous
-  or local classes declared after it.
+  or local classes declared after it. Repeated expressions count as checked
+  too: `map.get(k) != null && map.get(k).isEmpty()`.
+- **Knows library methods.** Outrigger asks jdtls for each project's classpath
+  (`java.project.getClasspaths`) and decides for library methods without a
+  `@Nullable` annotation whether they can return null. They can if any of these
+  says so:
+  1. an override in `~/.config/outrigger/nullness.txt`,
+  2. their annotations (`@Nullable`: jdtls reports those uses itself),
+  3. their contract: the Javadoc from the `-sources.jar` next to the jar, or
+     the JDK's `lib/src.zip` ("the page or `null`"),
+  4. their code: a data-flow analysis of the bytecode. For interfaces, the
+     code of their implementations in the directories configured as
+     `implementations`, e.g. a local AEM's bundles, where `PageManager` and
+     `Asset` are implemented.
+
+  To keep this precise: for the JDK, `javax` and `jakarta` only the contract
+  counts; implementations only count from the interface's own vendor
+  (`com/day/cq/...` for `com.day.cq` interfaces) and never anonymous classes;
+  an interface's default method counts by its implementations; `null` returned
+  only for `null` input (`if (s == null) return null;`, "`null` if null input")
+  doesn't count. In test sources, library-based warnings are off unless
+  `libraryWarningsInTests=true`.
 
 Limits:
-- Calls into other modules and library jars are not analysed.
 - Check methods are recognised by name, whatever class they come from.
-- Only local variables and fields that are never re-assigned are tracked.
+- Only local variables, fields that are never re-assigned and repeated
+  expressions are tracked.
+- A library method whose documentation says nothing and whose implementation
+  isn't available counts as not nullable.
+
+## Configuration
+
+`~/.config/outrigger/config.properties`:
+
+```properties
+# Directories (separated by ":") searched for jars implementing library
+# interfaces, e.g. the bundles of a local AEM. Indexed once, cached in
+# ~/.cache/outrigger.
+implementations=~/dev/aem/crx-quickstart/launchpad/felix
+# Also report unchecked uses of nullable library methods in test sources
+libraryWarningsInTests=false
+```
+
+`~/.config/outrigger/nullness.txt` overrides single methods:
+
+```
+com.day.cq.wcm.api.PageManager#getPage nullable
+javax.servlet.ServletRequest#getRequestDispatcher nonnull
+```
 
 ## Build
 
@@ -90,7 +133,8 @@ require("jdtls").start_or_attach(config)
 | `rpc` | LSP base protocol: `Content-Length` framing, raw message bodies |
 | `proxy` | Two pumps (client→server, server→client), `Feature` hooks |
 | `document` | Mirrors open documents from `didOpen`/`didChange`/`didClose`, including the negotiated position encoding (UTF-8/16/32) |
-| `nullness` | The null analysis, on a [JavaParser](https://javaparser.org) AST |
+| `nullness` | The null analysis, on a [JavaParser](https://javaparser.org) AST, with symbol resolution |
+| `library` | Library methods: classpath jars, sources, bytecode analysis ([ASM](https://asm.ow2.io)), implementation index |
 
 A `Feature` decides which diagnostics it wants to see and rewrites them.
 Diagnostics for files that are not open are only analysed when they contain
@@ -100,7 +144,5 @@ holds are passed through unchanged, and so is anything a feature fails on.
 
 ## Ideas
 
-- Cross-file inference: resolve callees through jdtls (`textDocument/definition`)
-  so methods in other classes are covered.
 - Code actions, e.g. "add `@Nullable` to this method".
 - Hover text explaining why a value may be null.

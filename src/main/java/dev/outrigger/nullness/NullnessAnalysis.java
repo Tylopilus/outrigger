@@ -29,6 +29,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.outrigger.document.PositionEncoding;
 import dev.outrigger.document.TextDocument;
+import dev.outrigger.library.LibraryNullness;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Null analysis applied to the diagnostics of one document:
@@ -69,35 +71,56 @@ final class NullnessAnalysis {
     private final JsonArray added = new JsonArray();
 
     private NullnessAnalysis(TextDocument document, PositionEncoding encoding, CompilationUnit unit,
-            TypeSolver typeSolver) {
+            TypeSolver typeSolver, LibraryNullness library, boolean reportLibrary) {
         this.document = document;
         this.encoding = encoding;
         this.unit = unit;
-        this.nullable = new NullableMethods(new MethodResolver(typeSolver));
+        this.nullable = new NullableMethods(new MethodResolver(typeSolver), library, reportLibrary);
         findUncheckedUses();
         findUncheckedFields();
     }
 
-    /** Parses the document; empty when it does not parse (e.g. while typing). */
-    static Optional<NullnessAnalysis> of(TextDocument document, PositionEncoding encoding) {
+    /**
+     * Parses the document; empty when it does not parse (e.g. while typing).
+     * {@code projects} gives the project of a source folder once its classpath
+     * is known: its other modules' sources, jars and library nullness.
+     */
+    static Optional<NullnessAnalysis> of(TextDocument document, PositionEncoding encoding,
+            Function<Path, Optional<Projects.Project>> projects) {
         ParseResult<CompilationUnit> result = new JavaParser(parserConfiguration()).parse(document.text());
         if (!result.isSuccessful() || result.getResult().isEmpty()) {
             return Optional.empty();
         }
         CompilationUnit unit = result.getResult().get();
+        Optional<Path> root = sourceRoot(document, unit);
+        Optional<Projects.Project> project = root.flatMap(projects);
 
-        // The JDK, and the other files of the module for calls into them
-        CombinedTypeSolver typeSolver = new CombinedTypeSolver(new ReflectionTypeSolver());
-        sourceRoot(document, unit).ifPresent(root -> {
-            try {
-                typeSolver.add(new JavaParserTypeSolver(root, parserConfiguration()));
-            } catch (RuntimeException e) {
-                // e.g. an unreadable directory: analyse the file on its own
-            }
-        });
+        // This module's sources, the other modules' sources, the jars, the JDK
+        CombinedTypeSolver typeSolver = new CombinedTypeSolver();
+        root.ifPresent(dir -> addSources(typeSolver, dir));
+        project.ifPresent(p -> p.sourceRoots().stream()
+                .filter(dir -> !root.get().equals(dir))
+                .forEach(dir -> addSources(typeSolver, dir)));
+        typeSolver.add(project.<TypeSolver>map(p -> new SharedTypeSolver(p.jars())).orElseGet(ReflectionTypeSolver::new));
         new JavaSymbolSolver(typeSolver).inject(unit);
 
-        return Optional.of(new NullnessAnalysis(document, encoding, unit, typeSolver));
+        boolean inTests = root.map(dir -> dir.toString().contains("/src/test/")).orElse(false);
+        boolean reportLibrary = !inTests || project.map(Projects.Project::libraryWarningsInTests).orElse(false);
+        return Optional.of(new NullnessAnalysis(document, encoding, unit, typeSolver,
+                project.map(Projects.Project::nullness).orElse(null), reportLibrary));
+    }
+
+    /** Test and tool entry point without a project: this file's module and the JDK. */
+    static Optional<NullnessAnalysis> of(TextDocument document, PositionEncoding encoding) {
+        return of(document, encoding, root -> Optional.empty());
+    }
+
+    private static void addSources(CombinedTypeSolver typeSolver, Path dir) {
+        try {
+            typeSolver.add(new JavaParserTypeSolver(dir, parserConfiguration()));
+        } catch (RuntimeException e) {
+            // e.g. an unreadable directory: go on without it
+        }
     }
 
     private static ParserConfiguration parserConfiguration() {
@@ -167,18 +190,16 @@ final class NullnessAnalysis {
         for (CallableDeclaration<?> callable : unit.findAll(CallableDeclaration.class)) {
             for (VariableDeclarator declarator : callable.findAll(VariableDeclarator.class)) {
                 Optional<Expression> initializer = declarator.getInitializer();
-                if (initializer.isEmpty() || !nullable.mayBeNull(initializer.get())
-                        || enclosingCallable(declarator) != callable) {
-                    continue;
+                Optional<String> why = initializer.flatMap(nullable::reportable);
+                if (why.isEmpty() || enclosingCallable(declarator) != callable) {
+                    continue; // not nullable, or annotated @Nullable: then jdtls reports it
                 }
                 String var = declarator.getNameAsString();
                 if (callable.findFirst(AssignExpr.class, a -> NullChecks.isVar(a.getTarget(), var)).isPresent()) {
                     continue; // re-assigned: its nullness depends on flow we do not follow
                 }
                 tracked.computeIfAbsent(callable, c -> new HashSet<>()).add(var);
-                String reason = nullable.resolve(initializer.get())
-                        .map(m -> " (" + m.getNameAsString() + "() can return null)")
-                        .orElse("");
+                String reason = why.get().isEmpty() ? "" : " (" + why.get() + ")";
                 Position declared = declarator.getBegin().orElseThrow();
                 for (Expression scope : dereferencedScopes(callable)) {
                     if (NullChecks.isVar(scope, var) && scope.getBegin().orElseThrow().isAfter(declared)
@@ -189,8 +210,9 @@ final class NullnessAnalysis {
             }
             for (Expression scope : dereferencedScopes(callable)) {
                 if (enclosingCallable(scope) == callable) {
-                    nullable.resolve(scope).ifPresent(method -> report(scope,
-                            "Potential null pointer access: " + method.getNameAsString() + "() can return null"));
+                    nullable.reportable(scope).filter(why -> !why.isEmpty())
+                            .filter(why -> !NullChecks.isCheckedExpression(scope)) // map.get(k) != null && map.get(k)...
+                            .ifPresent(why -> report(scope, "Potential null pointer access: " + why));
                 }
             }
         }
@@ -205,15 +227,13 @@ final class NullnessAnalysis {
         for (FieldDeclaration field : unit.findAll(FieldDeclaration.class)) {
             TypeDeclaration<?> owner = field.findAncestor(TypeDeclaration.class).orElse(null);
             for (VariableDeclarator declarator : field.getVariables()) {
-                Optional<Expression> initializer = declarator.getInitializer();
+                Optional<String> why = declarator.getInitializer().flatMap(nullable::reportable);
                 String name = declarator.getNameAsString();
-                if (owner == null || initializer.isEmpty() || !nullable.mayBeNull(initializer.get())
+                if (owner == null || why.isEmpty()
                         || unit.findFirst(AssignExpr.class, a -> NullChecks.isVar(a.getTarget(), name)).isPresent()) {
                     continue;
                 }
-                String reason = nullable.resolve(initializer.get())
-                        .map(m -> " (" + m.getNameAsString() + "() can return null)")
-                        .orElse("");
+                String reason = why.get().isEmpty() ? "" : " (" + why.get() + ")";
                 for (CallableDeclaration<?> callable : owner.findAll(CallableDeclaration.class)) {
                     if (declaresLocally(callable, name)) {
                         continue; // a local variable or parameter hides the field

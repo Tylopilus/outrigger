@@ -34,28 +34,54 @@ final class MethodResolver {
 
     private final TypeSolver typeSolver;
     private final JavaParserFacade facade;
-    private final Map<MethodCallExpr, Optional<MethodDeclaration>> cache = new IdentityHashMap<>();
+    private final Map<MethodCallExpr, Optional<Target>> cache = new IdentityHashMap<>();
+
+    /** What a call invokes: a method with source in the project, or a library method. */
+    sealed interface Target {
+        record Source(MethodDeclaration declaration) implements Target {
+        }
+
+        /** {@code owner} is an internal name ({@code com/day/cq/wcm/api/PageManager}). */
+        record Library(String owner, String name, String descriptor) implements Target {
+            String display() {
+                return owner.substring(Math.max(owner.lastIndexOf('/'), owner.lastIndexOf('$')) + 1) + "." + name
+                        + "()";
+            }
+        }
+    }
 
     MethodResolver(TypeSolver typeSolver) {
         this.typeSolver = typeSolver;
         this.facade = JavaParserFacade.get(typeSolver);
     }
 
-    Optional<MethodDeclaration> target(MethodCallExpr call) {
+    Optional<Target> target(MethodCallExpr call) {
         return cache.computeIfAbsent(call, this::find);
     }
 
-    private Optional<MethodDeclaration> find(MethodCallExpr call) {
+    private Optional<Target> find(MethodCallExpr call) {
         try {
             SymbolReference<ResolvedMethodDeclaration> solved = facade.solve(call);
             if (solved.isSolved()) {
-                // a library method has no source to look at
-                return solved.getCorrespondingDeclaration().toAst(MethodDeclaration.class);
+                ResolvedMethodDeclaration method = solved.getCorrespondingDeclaration();
+                Optional<MethodDeclaration> source = method.toAst(MethodDeclaration.class);
+                return source.isPresent() ? source.map(Target.Source::new) : library(method);
             }
         } catch (RuntimeException | StackOverflowError e) {
             // unresolved argument types and the like: fall back to the lookup by name
         }
-        return byName(call);
+        return byName(call).map(Target.Source::new);
+    }
+
+    private static Optional<Target> library(ResolvedMethodDeclaration method) {
+        try {
+            String packageName = method.declaringType().getPackageName();
+            String className = method.declaringType().getClassName().replace('.', '$');
+            String owner = (packageName.isEmpty() ? "" : packageName.replace('.', '/') + "/") + className;
+            return Optional.of(new Target.Library(owner, method.getName(), method.toDescriptor()));
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
     }
 
     private Optional<MethodDeclaration> byName(MethodCallExpr call) {

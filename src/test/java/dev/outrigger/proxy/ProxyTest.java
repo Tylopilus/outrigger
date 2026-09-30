@@ -90,6 +90,62 @@ class ProxyTest {
         proxyThread.join();
     }
 
+    @Test
+    void ownRequestsGoToTheServerAndTheirResponsesNotToTheEditor() throws Exception {
+        Pipe clientToProxy = new Pipe();
+        Pipe proxyToClient = new Pipe();
+        Pipe proxyToServer = new Pipe();
+        Pipe serverToProxy = new Pipe();
+        java.util.concurrent.atomic.AtomicReference<ServerAccess> access = new java.util.concurrent.atomic.AtomicReference<>();
+        Feature feature = new Feature() {
+            @Override
+            public void attach(ServerAccess server) {
+                access.set(server);
+            }
+
+            @Override
+            public boolean wantsDiagnostics(JsonArray diagnostics, boolean documentOpen) {
+                return false;
+            }
+
+            @Override
+            public JsonArray diagnostics(dev.outrigger.document.TextDocument document, JsonArray diagnostics,
+                    dev.outrigger.document.PositionEncoding encoding) {
+                return diagnostics;
+            }
+        };
+        Proxy proxy = new Proxy(clientToProxy.in, proxyToClient.out, serverToProxy.in, proxyToServer.out,
+                List.of(feature));
+        Thread proxyThread = Thread.ofPlatform().start(() -> {
+            try {
+                proxy.run();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        MessageWriter server = new MessageWriter(serverToProxy.out);
+        MessageReader serverInbox = new MessageReader(proxyToServer.in);
+        MessageReader clientInbox = new MessageReader(proxyToClient.in);
+
+        var response = access.get().request("workspace/executeCommand", JsonParser.parseString("{\"command\":\"x\"}"));
+        JsonObject request = JsonParser.parseString(new String(serverInbox.read(), StandardCharsets.UTF_8))
+                .getAsJsonObject();
+        assertEquals("workspace/executeCommand", request.get("method").getAsString());
+
+        server.write("{\"jsonrpc\":\"2.0\",\"id\":" + request.get("id") + ",\"result\":{\"ok\":true}}");
+        assertEquals(JsonParser.parseString("{\"ok\":true}"), response.get(5, java.util.concurrent.TimeUnit.SECONDS));
+
+        // the editor only sees what the server sends it afterwards, not the response
+        String notification = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{}}";
+        server.write(notification);
+        assertArrayEquals(bytes(notification), clientInbox.read());
+
+        clientToProxy.out.close();
+        assertNull(serverInbox.read());
+        serverToProxy.out.close();
+        proxyThread.join();
+    }
+
     private static String didOpen(String text) {
         JsonObject doc = new JsonObject();
         doc.addProperty("uri", URI);

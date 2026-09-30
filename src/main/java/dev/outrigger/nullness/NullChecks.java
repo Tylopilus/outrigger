@@ -67,11 +67,33 @@ final class NullChecks {
                         && field.getNameAsString().equals(var);
     }
 
+    /**
+     * What is checked for null: a variable, or an expression that is repeated,
+     * as in {@code map.get(key) != null && map.get(key).isEmpty()}.
+     */
+    record Subject(String var, Expression expression) {
+        static Subject variable(String name) {
+            return new Subject(name, null);
+        }
+
+        static Subject of(Expression expression) {
+            return new Subject(null, unwrap(expression));
+        }
+
+        boolean is(Expression candidate) {
+            return var != null ? isVar(candidate, var) : unwrap(candidate).equals(expression);
+        }
+    }
+
     /** Whether {@code condition} evaluating to {@code truth} proves that {@code var} is not null. */
     static boolean proves(Expression condition, String var, boolean truth) {
+        return proves(condition, Subject.variable(var), truth);
+    }
+
+    static boolean proves(Expression condition, Subject subject, boolean truth) {
         Expression cond = unwrap(condition);
         if (cond instanceof UnaryExpr unary && unary.getOperator() == UnaryExpr.Operator.LOGICAL_COMPLEMENT) {
-            return proves(unary.getExpression(), var, !truth);
+            return proves(unary.getExpression(), subject, !truth);
         }
         if (cond instanceof BinaryExpr binary) {
             Expression left = binary.getLeft();
@@ -80,12 +102,12 @@ final class NullChecks {
                 case OR, AND -> {
                     boolean eachHasSameValue = (binary.getOperator() == BinaryExpr.Operator.OR) != truth;
                     return eachHasSameValue
-                            ? proves(left, var, truth) || proves(right, var, truth)
-                            : proves(left, var, truth) && proves(right, var, truth);
+                            ? proves(left, subject, truth) || proves(right, subject, truth)
+                            : proves(left, subject, truth) && proves(right, subject, truth);
                 }
                 case EQUALS, NOT_EQUALS -> {
-                    boolean compared = (unwrap(left) instanceof NullLiteralExpr && isVar(right, var))
-                            || (unwrap(right) instanceof NullLiteralExpr && isVar(left, var));
+                    boolean compared = (unwrap(left) instanceof NullLiteralExpr && subject.is(right))
+                            || (unwrap(right) instanceof NullLiteralExpr && subject.is(left));
                     return compared && (binary.getOperator() == BinaryExpr.Operator.NOT_EQUALS) == truth;
                 }
                 default -> {
@@ -96,7 +118,7 @@ final class NullChecks {
         if (cond instanceof MethodCallExpr call) {
             Boolean nonNullWhen = NON_NULL_WHEN.get(call.getNameAsString());
             return nonNullWhen != null && nonNullWhen == truth
-                    && call.getArguments().stream().anyMatch(arg -> isVar(arg, var));
+                    && call.getArguments().stream().anyMatch(subject::is);
         }
         return false;
     }
@@ -110,36 +132,46 @@ final class NullChecks {
      *                    re-assigned
      */
     static boolean isChecked(Node node, String var, boolean crossLambda) {
+        return isChecked(node, Subject.variable(var), crossLambda);
+    }
+
+    /** Whether the repeated expression at {@code node} is known not to be null there. */
+    static boolean isCheckedExpression(Expression expression) {
+        return isChecked(expression, Subject.of(expression), false);
+    }
+
+    private static boolean isChecked(Node node, Subject subject, boolean crossLambda) {
         Node child = node;
         Node parent = node.getParentNode().orElse(null);
         while (parent != null) {
-            if (parent instanceof CallableDeclaration<?> callable && (!crossLambda || declares(callable, var))) {
+            if (parent instanceof CallableDeclaration<?> callable
+                    && (!crossLambda || subject.var() == null || declares(callable, subject.var()))) {
                 return false;
             }
             if (parent instanceof LambdaExpr && !crossLambda) {
                 return false;
             }
             if (parent instanceof BinaryExpr binary && binary.getRight() == child) {
-                if (binary.getOperator() == BinaryExpr.Operator.OR && proves(binary.getLeft(), var, false)
-                        || binary.getOperator() == BinaryExpr.Operator.AND && proves(binary.getLeft(), var, true)) {
+                if (binary.getOperator() == BinaryExpr.Operator.OR && proves(binary.getLeft(), subject, false)
+                        || binary.getOperator() == BinaryExpr.Operator.AND && proves(binary.getLeft(), subject, true)) {
                     return true;
                 }
             } else if (parent instanceof IfStmt ifStmt) {
-                if (ifStmt.getThenStmt() == child && proves(ifStmt.getCondition(), var, true)
-                        || ifStmt.getElseStmt().orElse(null) == child && proves(ifStmt.getCondition(), var, false)) {
+                if (ifStmt.getThenStmt() == child && proves(ifStmt.getCondition(), subject, true)
+                        || ifStmt.getElseStmt().orElse(null) == child && proves(ifStmt.getCondition(), subject, false)) {
                     return true;
                 }
             } else if (parent instanceof ConditionalExpr ternary) {
-                if (ternary.getThenExpr() == child && proves(ternary.getCondition(), var, true)
-                        || ternary.getElseExpr() == child && proves(ternary.getCondition(), var, false)) {
+                if (ternary.getThenExpr() == child && proves(ternary.getCondition(), subject, true)
+                        || ternary.getElseExpr() == child && proves(ternary.getCondition(), subject, false)) {
                     return true;
                 }
             } else if (parent instanceof WhileStmt loop) {
-                if (loop.getBody() == child && proves(loop.getCondition(), var, true)) {
+                if (loop.getBody() == child && proves(loop.getCondition(), subject, true)) {
                     return true;
                 }
             } else if (parent instanceof BlockStmt block && child instanceof Statement statement) {
-                Boolean earlier = checkedByEarlierStatements(block.getStatements(), statement, var);
+                Boolean earlier = checkedByEarlierStatements(block.getStatements(), statement, subject);
                 if (earlier != null) {
                     return earlier;
                 }
@@ -153,32 +185,35 @@ final class NullChecks {
     /**
      * Looks at the statements before {@code statement} in its block: an
      * {@code if (<null check>) return;} or {@code requireNonNull} proves it,
-     * an assignment to the variable ends the search. {@code null} means
-     * undecided, keep looking further out.
+     * an assignment to the variable (or to one used in the expression) ends
+     * the search. {@code null} means undecided, keep looking further out.
      */
-    private static Boolean checkedByEarlierStatements(List<Statement> statements, Statement statement, String var) {
+    private static Boolean checkedByEarlierStatements(List<Statement> statements, Statement statement,
+            Subject subject) {
         for (int i = statements.indexOf(statement) - 1; i >= 0; i--) {
             Statement previous = statements.get(i);
-            if (requiresNonNull(previous, var)) {
+            if (requiresNonNull(previous, subject)) {
                 return true;
             }
-            if (assigns(previous, var)) {
+            if (subject.var() != null ? assigns(previous, subject.var())
+                    : subject.expression().findAll(NameExpr.class).stream()
+                            .anyMatch(name -> assigns(previous, name.getNameAsString()))) {
                 return false;
             }
             if (previous instanceof IfStmt ifStmt && ifStmt.getElseStmt().isEmpty()
-                    && alwaysExits(ifStmt.getThenStmt()) && proves(ifStmt.getCondition(), var, false)) {
+                    && alwaysExits(ifStmt.getThenStmt()) && proves(ifStmt.getCondition(), subject, false)) {
                 return true;
             }
         }
         return null;
     }
 
-    private static boolean requiresNonNull(Statement statement, String var) {
+    private static boolean requiresNonNull(Statement statement, Subject subject) {
         return statement instanceof ExpressionStmt expression
                 && expression.getExpression() instanceof MethodCallExpr call
                 && call.getNameAsString().equals("requireNonNull")
                 && call.getArguments().isNonEmpty()
-                && isVar(call.getArgument(0), var);
+                && subject.is(call.getArgument(0));
     }
 
     /** Whether {@code callable} has a parameter or local variable named {@code var}. */

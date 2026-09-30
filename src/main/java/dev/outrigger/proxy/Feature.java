@@ -9,6 +9,10 @@ import dev.outrigger.document.TextDocument;
  */
 public interface Feature {
 
+    /** Called once when the proxy starts, with access to the server. */
+    default void attach(ServerAccess server) {
+    }
+
     /**
      * Whether this feature wants to look at diagnostics published for a
      * document. Documents that are not open have to be read from disk, so
